@@ -1,0 +1,29 @@
+*(لا تنسَ إنشاء مجلد فارغ باسم `sfda-cosmetic-sync-worker/state/` وبداخله ملف فارغ `.gitkeep`).*
+
+---
+
+### قائمة الملفات المنشأة في المرحلة 4 (13 ملفاً + `state/.gitkeep`)
+1. `sfda-cosmetic-sync-worker/requirements.txt` — الحزم الإنتاجية الخفيفة (بدون Playwright).
+2. `sfda-cosmetic-sync-worker/.env.example` — قالب الإعدادات للتشغيل المحلي.
+3. `sfda-cosmetic-sync-worker/.gitignore` — استبعاد الأسرار وحالة التشغيل المؤقتة.
+4. `sfda-cosmetic-sync-worker/src/__init__.py` — تهيئة الحزمة.
+5. `sfda-cosmetic-sync-worker/src/config.py` — خريطة القوائم الخمس الرسمية وإعدادات التشغيل.
+6. `sfda-cosmetic-sync-worker/src/models.py` — نماذج المكون العلمي وحالة الاستئناف.
+7. `sfda-cosmetic-sync-worker/src/hasher.py` — التطبيع القياسي وتوليد `source_key` و `SHA-256` المتطابق مع PHP.
+8. `sfda-cosmetic-sync-worker/src/checkpoint.py` — إدارة نقاط الاستئناف الذرية وبناء ملف `sfda_emergency_export.json`.
+9. `sfda-cosmetic-sync-worker/src/http_client.py` — عميل HTTPX المقاوم للتعليق والـ Soft-Blocks مع Rate Limiting و Backoff.
+10. `sfda-cosmetic-sync-worker/src/scraper.py` — مستخرج الجداول والتفاصيل العلمية وحماية حالة `id=` الفارغ والإثراء الذكي من `nid=17590`.
+11. `sfda-cosmetic-sync-worker/src/wp_uploader.py` — عميل الرفع الموقّع بـ `HMAC-SHA256` لبوابة ووردبريس.
+12. `sfda-cosmetic-sync-worker/src/main.py` — منسق دورة الجلسة والرفع المتدرج والاعتماد الذري.
+13. `sfda-cosmetic-sync-worker/.github/workflows/sfda-sync.yml` — أتمتة التشغيل اليومي واليدوي وحفظ Checkpoints و Artifacts.
+14. `sfda-cosmetic-sync-worker/README.md` — توثيق إعداد GitHub Secrets والتشغيل.
+
+---
+
+### خطوات اختبار هذه المرحلة عملياً
+
+1. **اختبار السحب السريع لأصغر قائمة (`uv_filters` — 4 صفحات ≈ 40 مكوناً) بدون الحاجة لووردبريس:**
+   من داخل مجلد `sfda-cosmetic-sync-worker/` (أو على GitHub Actions عبر زر **Run workflow** مع تفعيل `dry_run: true` و `lists_scope: uv_filters`):
+   ```bash
+   pip install -r requirements.txt
+   python -m src.main --lists uv_filters --dry-run
