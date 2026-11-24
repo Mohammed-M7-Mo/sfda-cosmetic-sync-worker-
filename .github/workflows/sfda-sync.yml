@@ -66,8 +66,8 @@ jobs:
           WP_SFDA_API_KEY: ${{ secrets.WP_SFDA_API_KEY }}
           WP_SFDA_HMAC_SECRET: ${{ secrets.WP_SFDA_HMAC_SECRET }}
           SFDA_LISTS_SCOPE: ${{ github.event.inputs.lists_scope || 'all' }}
-          SFDA_REQUEST_DELAY_SEC: "0.45"
-          SFDA_DETAIL_CONCURRENCY: "3"
+          SFDA_REQUEST_DELAY_SEC: "0.60"
+          SFDA_DETAIL_CONCURRENCY: "2"
           SFDA_HTTP_TIMEOUT_SEC: "45"
           SFDA_MAX_RETRIES: "5"
           SFDA_BATCH_SIZE: "100"
