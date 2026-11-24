@@ -1,0 +1,11 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+state/*
+!state/.gitkeep
+discovery/discovery_report.json
+discovery/page_snapshot.html
+discovery/extra_discovery.json
+.DS_Store
