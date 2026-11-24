@@ -1,8 +1,8 @@
 """
 SFDA Cosmetic Lists HTML Scraper & Detail Extractor.
-Built directly against the verified Drupal HTML & `/ar/details_data` structure from Stage 1.
-Handles genuinely empty SFDA pagination gaps via single confirmation retry and applies
-gentle concurrency throttling to minimize Connection Reset (Errno 104) errors.
+Built directly against the verified Drupal HTML & `/ar/details_data` structure.
+Handles transient SFDA "لا توجد نتائج" (empty 200 OK) glitches via progressive backoff retries
+plus an end-of-list rescue pass, and caps detail concurrency to minimize Errno 104 resets.
 """
 
 from __future__ import annotations
@@ -25,6 +25,10 @@ from .models import IngredientRecord
 logger = logging.getLogger(__name__)
 
 _PAGE_PARAM_RE = re.compile(r"[?&]page=(\d+)")
+
+# Progressive wait delays (seconds) when SFDA returns a 200 OK page with 0 table rows ("لا توجد نتائج")
+_EMPTY_PAGE_RETRY_DELAYS: tuple[float, ...] = (5.0, 10.0, 18.0, 30.0, 45.0)
+_RESCUE_PASS_RETRY_DELAYS: tuple[float, ...] = (12.0, 25.0)
 
 # Normalized lowercase label -> canonical field key
 _DETAIL_LABEL_MAP: dict[str, str] = {
@@ -98,8 +102,8 @@ def _extract_raw_rows_from_soup(soup: BeautifulSoup, page_num: int) -> list[RawT
 
 def _is_valid_sfda_list_html(html: str) -> bool:
     """
-    Confirm the response is a genuine SFDA Drupal list page (even if SFDA has
-    a genuinely empty pagination gap with no table on that page).
+    Confirm the response is a genuine SFDA Drupal list page (even if SFDA
+    temporarily returns "لا توجد نتائج" with no table).
     """
     if len(html) < 5000:
         return False
@@ -167,6 +171,24 @@ class SfdaScraper:
         self.http = http_client
         self.detail_concurrency = max(1, min(self.MAX_SAFE_CONCURRENCY, detail_concurrency))
         self.enable_enrichment = enable_enrichment
+        self.unrecovered_empty_pages: dict[str, list[int]] = {}
+
+    def _reset_http_connection(self) -> None:
+        """Best-effort reset of underlying HTTP session/pool to escape stale SFDA connections."""
+        for attr in ("reset_session", "close"):
+            fn = getattr(self.http, attr, None)
+            if callable(fn) and attr == "reset_session":
+                try:
+                    fn()
+                    return
+                except Exception:
+                    pass
+        session = getattr(self.http, "_session", None) or getattr(self.http, "session", None)
+        if session is not None and hasattr(session, "cookies"):
+            try:
+                session.cookies.clear()
+            except Exception:
+                pass
 
     def _discover_max_page(self, soup: BeautifulSoup, current_page: int) -> int:
         max_page = current_page
@@ -179,12 +201,18 @@ class SfdaScraper:
                     max_page = idx
         return max_page
 
-    def fetch_list_page(self, target: ListTarget, page_num: int) -> tuple[list[RawTableRow], int]:
+    def fetch_list_page(
+        self,
+        target: ListTarget,
+        page_num: int,
+        *,
+        retry_delays: tuple[float, ...] = _EMPTY_PAGE_RETRY_DELAYS,
+    ) -> tuple[list[RawTableRow], int]:
         """
         Fetch a single paginated list page (`?page=N`) and return:
         `(rows_on_page, discovered_max_page_index)`.
-        If a valid SFDA page returns 0 rows, performs one polite confirmation retry
-        to distinguish a transient glitch from a genuine SFDA pagination gap.
+        If SFDA returns a valid 200 OK page with 0 rows ("لا توجد نتائج"),
+        retries progressively with connection resets to recover transient Drupal glitches.
         """
         page_url = f"{target.url}?page={page_num}" if page_num > 0 else target.url
         html = self.http.get_text(page_url, validator=_is_valid_sfda_list_html, referer=target.url)
@@ -193,25 +221,45 @@ class SfdaScraper:
         max_page = self._discover_max_page(soup, page_num)
         rows = _extract_raw_rows_from_soup(soup, page_num)
 
-        if not rows:
+        if rows:
+            return rows, max_page
+
+        total_retries = len(retry_delays)
+        for attempt_idx, delay in enumerate(retry_delays, start=1):
             logger.warning(
-                "Page %d of [%s] returned 0 rows; retrying once after 2.5s to confirm...",
+                "Page %d of [%s] returned 0 rows ('لا توجد نتائج'); retry %d/%d after %.0fs...",
                 page_num + 1,
                 target.slug,
+                attempt_idx,
+                total_retries,
+                delay,
             )
-            time.sleep(2.5)
+            self._reset_http_connection()
+            time.sleep(delay)
+
             html_retry = self.http.get_text(page_url, validator=_is_valid_sfda_list_html, referer=target.url)
             soup_retry = BeautifulSoup(html_retry, "lxml")
             max_page = max(max_page, self._discover_max_page(soup_retry, page_num))
             rows = _extract_raw_rows_from_soup(soup_retry, page_num)
-            if not rows:
+
+            if rows:
                 logger.info(
-                    "Confirmed: Page %d of [%s] is genuinely empty on SFDA source. Continuing safely.",
+                    "Recovered page %d of [%s] on retry %d/%d (+%d rows).",
                     page_num + 1,
                     target.slug,
+                    attempt_idx,
+                    total_retries,
+                    len(rows),
                 )
+                return rows, max_page
 
-        return rows, max_page
+        logger.warning(
+            "Page %d of [%s] still returned 0 rows after %d retries; deferring to end-of-list rescue pass.",
+            page_num + 1,
+            target.slug,
+            total_retries,
+        )
+        return [], max_page
 
     def _fetch_detail_fields(
         self,
@@ -311,9 +359,15 @@ class SfdaScraper:
         target: ListTarget,
         page_num: int,
         used_source_keys: set[str],
+        *,
+        retry_delays: tuple[float, ...] = _EMPTY_PAGE_RETRY_DELAYS,
     ) -> tuple[list[IngredientRecord], int]:
         """Scrape one page of a list + fetch all row details with bounded safe concurrency."""
-        raw_rows, discovered_max_page = self.fetch_list_page(target, page_num)
+        raw_rows, discovered_max_page = self.fetch_list_page(
+            target,
+            page_num,
+            retry_delays=retry_delays,
+        )
         if not raw_rows:
             return [], discovered_max_page
 
@@ -387,11 +441,13 @@ class SfdaScraper:
     ) -> Iterator[tuple[int, int, list[IngredientRecord]]]:
         """
         Yield `(page_num, total_pages_known, records)` sequentially from `start_page`
-        through the final page of the list.
+        through the final page of the list, followed by an automatic end-of-list
+        rescue pass for any pages that returned 0 rows during the initial sweep.
         """
         page_num = max(0, start_page)
         last_page_idx = (known_total_pages - 1) if (known_total_pages and known_total_pages > 0) else 0
         pages_processed = 0
+        deferred_empty_pages: list[int] = []
 
         while True:
             records, discovered_max = self.scrape_page_records(target, page_num, used_source_keys)
@@ -399,6 +455,9 @@ class SfdaScraper:
                 last_page_idx = discovered_max
 
             total_pages = last_page_idx + 1
+            if not records:
+                deferred_empty_pages.append(page_num)
+
             yield page_num, total_pages, records
 
             pages_processed += 1
@@ -409,3 +468,47 @@ class SfdaScraper:
                 break
 
             page_num += 1
+
+        # End-of-list rescue pass for any pages that returned "لا توجد نتائج"
+        if deferred_empty_pages and max_pages_limit is None:
+            logger.info(
+                "Starting rescue pass for %d empty page(s) in [%s]: %s",
+                len(deferred_empty_pages),
+                target.slug,
+                [p + 1 for p in deferred_empty_pages],
+            )
+            self._reset_http_connection()
+            time.sleep(15.0)
+
+            still_empty: list[int] = []
+            total_pages = last_page_idx + 1
+
+            for retry_page in deferred_empty_pages:
+                rescued_records, discovered_max = self.scrape_page_records(
+                    target,
+                    retry_page,
+                    used_source_keys,
+                    retry_delays=_RESCUE_PASS_RETRY_DELAYS,
+                )
+                if discovered_max > last_page_idx:
+                    last_page_idx = discovered_max
+                    total_pages = last_page_idx + 1
+
+                if rescued_records:
+                    logger.info(
+                        "Rescue pass SUCCEEDED for page %d of [%s] (+%d rows).",
+                        retry_page + 1,
+                        target.slug,
+                        len(rescued_records),
+                    )
+                    yield retry_page, total_pages, rescued_records
+                else:
+                    still_empty.append(retry_page + 1)
+
+            if still_empty:
+                self.unrecovered_empty_pages[target.slug] = still_empty
+                logger.warning(
+                    "Unrecovered empty pages on SFDA source for [%s] after rescue pass: %s",
+                    target.slug,
+                    still_empty,
+                )
