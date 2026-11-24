@@ -1,0 +1,104 @@
+name: SFDA Cosmetic Mirror Sync
+
+on:
+  schedule:
+    # تشغيل يومي تلقائي الساعة 03:00 UTC (06:00 صباحاً بتوقيت الرياض)
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      lists_scope:
+        description: "القوائم المطلوبة (all أو قائمة مفصولة بفاصلة مثل uv_filters,preservatives)"
+        required: true
+        default: "all"
+        type: string
+      dry_run:
+        description: "تشغيل تجريبي بدون إرسال لووردبريس (يولّد ملف JSON الاحتياطي فقط)"
+        required: false
+        default: false
+        type: boolean
+      reset_checkpoint:
+        description: "تجاهل نقطة الاستئناف السابقة والبدء من الصفر"
+        required: false
+        default: false
+        type: boolean
+      force_commit:
+        description: "تجاوز حاجز الانخفاض الحاد (فقط عند التأكد من حذف جماعي رسمي من الهيئة)"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: sfda-cosmetic-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: "requirements.txt"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore checkpoint state (if previous run was interrupted)
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: sfda-sync-state-${{ github.run_id }}
+          restore-keys: |
+            sfda-sync-state-
+
+      - name: Run Resilient SFDA Sync Worker
+        env:
+          WP_SYNC_BASE_URL: ${{ secrets.WP_SYNC_BASE_URL }}
+          WP_SFDA_API_KEY: ${{ secrets.WP_SFDA_API_KEY }}
+          WP_SFDA_HMAC_SECRET: ${{ secrets.WP_SFDA_HMAC_SECRET }}
+          SFDA_LISTS_SCOPE: ${{ github.event.inputs.lists_scope || 'all' }}
+          SFDA_REQUEST_DELAY_SEC: "0.45"
+          SFDA_DETAIL_CONCURRENCY: "3"
+          SFDA_HTTP_TIMEOUT_SEC: "45"
+          SFDA_MAX_RETRIES: "5"
+          SFDA_BATCH_SIZE: "100"
+          SFDA_ENABLE_ENRICHMENT: "true"
+        run: |
+          ARGS=""
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          if [ "${{ github.event.inputs.reset_checkpoint }}" = "true" ]; then
+            ARGS="$ARGS --reset-checkpoint"
+          fi
+          if [ "${{ github.event.inputs.force_commit }}" = "true" ]; then
+            ARGS="$ARGS --force-commit"
+          fi
+          python -m src.main $ARGS
+
+      - name: Save checkpoint state for resume on interruption
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: sfda-sync-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Upload Emergency JSON Backup & Sync Summary Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sfda-sync-backup-${{ github.run_id }}
+          path: |
+            state/sfda_emergency_export.json
+            state/sync_summary.json
+          retention-days: 14
+          if-no-files-found: ignore
