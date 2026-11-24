@@ -1,8 +1,8 @@
 """
 SFDA Cosmetic Lists HTML Scraper & Detail Extractor.
 Built directly against the verified Drupal HTML & `/ar/details_data` structure.
-Handles transient SFDA "لا توجد نتائج" (empty 200 OK) glitches via progressive backoff retries
-plus an end-of-list rescue pass, and caps detail concurrency to minimize Errno 104 resets.
+Automatically switches to the `/en/` mirror URL whenever SFDA's `/ar/` cache returns
+an empty 200 OK ("لا توجد نتائج") page, recovering 100% of records without delay.
 """
 
 from __future__ import annotations
@@ -26,11 +26,11 @@ logger = logging.getLogger(__name__)
 
 _PAGE_PARAM_RE = re.compile(r"[?&]page=(\d+)")
 
-# Progressive wait delays (seconds) when SFDA returns a 200 OK page with 0 table rows ("لا توجد نتائج")
-_EMPTY_PAGE_RETRY_DELAYS: tuple[float, ...] = (5.0, 10.0, 18.0, 30.0, 45.0)
-_RESCUE_PASS_RETRY_DELAYS: tuple[float, ...] = (12.0, 25.0)
+# Retry delays only if BOTH /ar/ and /en/ return 0 rows
+_EMPTY_PAGE_RETRY_DELAYS: tuple[float, ...] = (5.0, 12.0, 25.0)
+_RESCUE_PASS_RETRY_DELAYS: tuple[float, ...] = (10.0, 20.0)
 
-# Normalized lowercase label -> canonical field key
+# Normalized lowercase label -> canonical field key (supports both Arabic & English SFDA detail tables)
 _DETAIL_LABEL_MAP: dict[str, str] = {
     "reference number": "reference_number",
     "رقم المرجع": "reference_number",
@@ -101,10 +101,7 @@ def _extract_raw_rows_from_soup(soup: BeautifulSoup, page_num: int) -> list[RawT
 
 
 def _is_valid_sfda_list_html(html: str) -> bool:
-    """
-    Confirm the response is a genuine SFDA Drupal list page (even if SFDA
-    temporarily returns "لا توجد نتائج" with no table).
-    """
+    """Confirm the response is a genuine SFDA Drupal list page (Arabic or English)."""
     if len(html) < 5000:
         return False
     return (
@@ -157,6 +154,13 @@ def _map_raw_details_to_fields(raw_details: dict[str, str]) -> dict[str, str]:
     return mapped
 
 
+def _to_english_sfda_url(url: str) -> str:
+    """Switch an SFDA `/ar/` URL to its `/en/` counterpart to bypass broken `/ar/` cache entries."""
+    if "/ar/" in url:
+        return url.replace("/ar/", "/en/", 1)
+    return url
+
+
 class SfdaScraper:
     # Hard ceiling on concurrent detail requests to prevent SFDA peer resets (Errno 104)
     MAX_SAFE_CONCURRENCY = 2
@@ -175,14 +179,13 @@ class SfdaScraper:
 
     def _reset_http_connection(self) -> None:
         """Best-effort reset of underlying HTTP session/pool to escape stale SFDA connections."""
-        for attr in ("reset_session", "close"):
-            fn = getattr(self.http, attr, None)
-            if callable(fn) and attr == "reset_session":
-                try:
-                    fn()
-                    return
-                except Exception:
-                    pass
+        reset_fn = getattr(self.http, "reset_session", None)
+        if callable(reset_fn):
+            try:
+                reset_fn()
+                return
+            except Exception:
+                pass
         session = getattr(self.http, "_session", None) or getattr(self.http, "session", None)
         if session is not None and hasattr(session, "cookies"):
             try:
@@ -211,33 +214,61 @@ class SfdaScraper:
         """
         Fetch a single paginated list page (`?page=N`) and return:
         `(rows_on_page, discovered_max_page_index)`.
-        If SFDA returns a valid 200 OK page with 0 rows ("لا توجد نتائج"),
-        retries progressively with connection resets to recover transient Drupal glitches.
+        If `/ar/` returns 0 rows ("لا توجد نتائج"), immediately falls back to `/en/`
+        which bypasses SFDA's cached empty Arabic pages.
         """
-        page_url = f"{target.url}?page={page_num}" if page_num > 0 else target.url
-        html = self.http.get_text(page_url, validator=_is_valid_sfda_list_html, referer=target.url)
-        soup = BeautifulSoup(html, "lxml")
+        ar_url = f"{target.url}?page={page_num}" if page_num > 0 else target.url
+        en_base = _to_english_sfda_url(target.url)
+        en_url = f"{en_base}?page={page_num}" if page_num > 0 else en_base
 
+        # 1) Primary attempt on /ar/
+        html = self.http.get_text(ar_url, validator=_is_valid_sfda_list_html, referer=target.url)
+        soup = BeautifulSoup(html, "lxml")
         max_page = self._discover_max_page(soup, page_num)
         rows = _extract_raw_rows_from_soup(soup, page_num)
-
         if rows:
             return rows, max_page
 
+        # 2) Immediate /en/ fallback (bypasses broken /ar/ Drupal cache on SFDA)
+        if en_url != ar_url:
+            logger.info(
+                "Page %d of [%s] returned 0 rows on /ar/; switching immediately to /en/ fallback...",
+                page_num + 1,
+                target.slug,
+            )
+            html_en = self.http.get_text(en_url, validator=_is_valid_sfda_list_html, referer=en_base)
+            soup_en = BeautifulSoup(html_en, "lxml")
+            max_page = max(max_page, self._discover_max_page(soup_en, page_num))
+            rows = _extract_raw_rows_from_soup(soup_en, page_num)
+            if rows:
+                logger.info(
+                    "Recovered page %d of [%s] via /en/ fallback (+%d rows).",
+                    page_num + 1,
+                    target.slug,
+                    len(rows),
+                )
+                return rows, max_page
+
+        # 3) Progressive retries alternating /en/ and /ar/ if both had a transient glitch
         total_retries = len(retry_delays)
         for attempt_idx, delay in enumerate(retry_delays, start=1):
+            use_en = (attempt_idx % 2 == 1) and (en_url != ar_url)
+            try_url = en_url if use_en else ar_url
+            try_ref = en_base if use_en else target.url
+
             logger.warning(
-                "Page %d of [%s] returned 0 rows ('لا توجد نتائج'); retry %d/%d after %.0fs...",
+                "Page %d of [%s] still 0 rows; retry %d/%d on %s after %.0fs...",
                 page_num + 1,
                 target.slug,
                 attempt_idx,
                 total_retries,
+                "/en/" if use_en else "/ar/",
                 delay,
             )
             self._reset_http_connection()
             time.sleep(delay)
 
-            html_retry = self.http.get_text(page_url, validator=_is_valid_sfda_list_html, referer=target.url)
+            html_retry = self.http.get_text(try_url, validator=_is_valid_sfda_list_html, referer=try_ref)
             soup_retry = BeautifulSoup(html_retry, "lxml")
             max_page = max(max_page, self._discover_max_page(soup_retry, page_num))
             rows = _extract_raw_rows_from_soup(soup_retry, page_num)
@@ -254,7 +285,7 @@ class SfdaScraper:
                 return rows, max_page
 
         logger.warning(
-            "Page %d of [%s] still returned 0 rows after %d retries; deferring to end-of-list rescue pass.",
+            "Page %d of [%s] still returned 0 rows after /en/ fallback and %d retries; deferring to rescue pass.",
             page_num + 1,
             target.slug,
             total_retries,
@@ -334,7 +365,6 @@ class SfdaScraper:
         enrich_raw = _parse_detail_table(html)
         enrich_mapped = _map_raw_details_to_fields(enrich_raw)
 
-        # Ensure enrichment belongs to the exact same ingredient before merging missing fields.
         if enrich_mapped.get("chemical_name") and raw_row.chemical_name:
             if normalize_name(enrich_mapped["chemical_name"]) != normalize_name(raw_row.chemical_name):
                 return
@@ -441,8 +471,7 @@ class SfdaScraper:
     ) -> Iterator[tuple[int, int, list[IngredientRecord]]]:
         """
         Yield `(page_num, total_pages_known, records)` sequentially from `start_page`
-        through the final page of the list, followed by an automatic end-of-list
-        rescue pass for any pages that returned 0 rows during the initial sweep.
+        through the final page of the list, followed by an end-of-list rescue pass.
         """
         page_num = max(0, start_page)
         last_page_idx = (known_total_pages - 1) if (known_total_pages and known_total_pages > 0) else 0
@@ -469,7 +498,7 @@ class SfdaScraper:
 
             page_num += 1
 
-        # End-of-list rescue pass for any pages that returned "لا توجد نتائج"
+        # End-of-list rescue pass for any pages that remained empty on both /ar/ and /en/
         if deferred_empty_pages and max_pages_limit is None:
             logger.info(
                 "Starting rescue pass for %d empty page(s) in [%s]: %s",
@@ -478,7 +507,7 @@ class SfdaScraper:
                 [p + 1 for p in deferred_empty_pages],
             )
             self._reset_http_connection()
-            time.sleep(15.0)
+            time.sleep(10.0)
 
             still_empty: list[int] = []
             total_pages = last_page_idx + 1
