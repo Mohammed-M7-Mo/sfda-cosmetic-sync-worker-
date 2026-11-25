@@ -3,7 +3,7 @@ name: SFDA Cosmetic Mirror Sync
 on:
   schedule:
     # تشغيل يومي تلقائي الساعة 03:00 UTC (06:00 صباحاً بتوقيت الرياض)
-   - cron: "5 7 * * *" 
+  - cron: "17 6 * * *"  
   workflow_dispatch:
     inputs:
       lists_scope:
