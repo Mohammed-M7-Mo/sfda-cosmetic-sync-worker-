@@ -54,6 +54,7 @@ class ListProgress:
     last_completed_page: int = -1
     items_scraped: int = 0
     completed: bool = False
+    failed_pages: list[int] = field(default_factory=list)
     used_source_keys: list[str] = field(default_factory=list)
 
 
@@ -86,6 +87,7 @@ class CheckpointState:
                 last_completed_page=int(item.get("last_completed_page", -1)),
                 items_scraped=int(item.get("items_scraped", 0)),
                 completed=bool(item.get("completed", False)),
+                failed_pages=[int(p) for p in (item.get("failed_pages") or [])],
                 used_source_keys=list(item.get("used_source_keys") or []),
             )
         return cls(
