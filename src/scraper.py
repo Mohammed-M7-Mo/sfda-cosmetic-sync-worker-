@@ -2,7 +2,8 @@
 SFDA Cosmetic Lists HTML Scraper & Detail Extractor.
 Built directly against the verified Drupal HTML & `/ar/details_data` structure.
 Automatically switches to the `/en/` mirror URL whenever SFDA's `/ar/` cache returns
-an empty 200 OK ("لا توجد نتائج") page, recovering 100% of records without delay.
+an empty 200 OK ("لا توجد نتائج") page, and runs two rescue passes with clean HTTP
+session resets to recover 100% of pages before reporting any unrecovered page.
 """
 
 from __future__ import annotations
@@ -27,8 +28,9 @@ logger = logging.getLogger(__name__)
 _PAGE_PARAM_RE = re.compile(r"[?&]page=(\d+)")
 
 # Retry delays only if BOTH /ar/ and /en/ return 0 rows
-_EMPTY_PAGE_RETRY_DELAYS: tuple[float, ...] = (5.0, 12.0, 25.0)
-_RESCUE_PASS_RETRY_DELAYS: tuple[float, ...] = (10.0, 20.0)
+_EMPTY_PAGE_RETRY_DELAYS: tuple[float, ...] = (5.0, 12.0, 22.0)
+_RESCUE_PASS_1_DELAYS: tuple[float, ...] = (10.0, 20.0)
+_RESCUE_PASS_2_DELAYS: tuple[float, ...] = (15.0, 30.0)
 
 # Normalized lowercase label -> canonical field key (supports both Arabic & English SFDA detail tables)
 _DETAIL_LABEL_MAP: dict[str, str] = {
@@ -178,20 +180,8 @@ class SfdaScraper:
         self.unrecovered_empty_pages: dict[str, list[int]] = {}
 
     def _reset_http_connection(self) -> None:
-        """Best-effort reset of underlying HTTP session/pool to escape stale SFDA connections."""
-        reset_fn = getattr(self.http, "reset_session", None)
-        if callable(reset_fn):
-            try:
-                reset_fn()
-                return
-            except Exception:
-                pass
-        session = getattr(self.http, "_session", None) or getattr(self.http, "session", None)
-        if session is not None and hasattr(session, "cookies"):
-            try:
-                session.cookies.clear()
-            except Exception:
-                pass
+        """Reset underlying HTTPX pool and cookies to escape stale SFDA connections."""
+        self.http.reset_session()
 
     def _discover_max_page(self, soup: BeautifulSoup, current_page: int) -> int:
         max_page = current_page
@@ -214,42 +204,61 @@ class SfdaScraper:
         """
         Fetch a single paginated list page (`?page=N`) and return:
         `(rows_on_page, discovered_max_page_index)`.
-        If `/ar/` returns 0 rows ("لا توجد نتائج"), immediately falls back to `/en/`
-        which bypasses SFDA's cached empty Arabic pages.
+        If `/ar/` returns 0 rows ("لا توجد نتائج") or fails transiently, immediately falls back
+        to `/en/` and resets the HTTP session on progressive retries.
         """
         ar_url = f"{target.url}?page={page_num}" if page_num > 0 else target.url
         en_base = _to_english_sfda_url(target.url)
         en_url = f"{en_base}?page={page_num}" if page_num > 0 else en_base
 
+        max_page = page_num
+
         # 1) Primary attempt on /ar/
-        html = self.http.get_text(ar_url, validator=_is_valid_sfda_list_html, referer=target.url)
-        soup = BeautifulSoup(html, "lxml")
-        max_page = self._discover_max_page(soup, page_num)
-        rows = _extract_raw_rows_from_soup(soup, page_num)
-        if rows:
-            return rows, max_page
+        try:
+            html = self.http.get_text(ar_url, validator=_is_valid_sfda_list_html, referer=target.url)
+            soup = BeautifulSoup(html, "lxml")
+            max_page = max(max_page, self._discover_max_page(soup, page_num))
+            rows = _extract_raw_rows_from_soup(soup, page_num)
+            if rows:
+                return rows, max_page
+        except Exception as exc:
+            logger.warning(
+                "Primary /ar/ fetch failed for page %d of [%s] (%s); trying /en/ fallback...",
+                page_num + 1,
+                target.slug,
+                exc,
+            )
+            self._reset_http_connection()
 
         # 2) Immediate /en/ fallback (bypasses broken /ar/ Drupal cache on SFDA)
         if en_url != ar_url:
             logger.info(
-                "Page %d of [%s] returned 0 rows on /ar/; switching immediately to /en/ fallback...",
+                "Page %d of [%s] returned 0 rows/error on /ar/; switching to /en/ fallback...",
                 page_num + 1,
                 target.slug,
             )
-            html_en = self.http.get_text(en_url, validator=_is_valid_sfda_list_html, referer=en_base)
-            soup_en = BeautifulSoup(html_en, "lxml")
-            max_page = max(max_page, self._discover_max_page(soup_en, page_num))
-            rows = _extract_raw_rows_from_soup(soup_en, page_num)
-            if rows:
-                logger.info(
-                    "Recovered page %d of [%s] via /en/ fallback (+%d rows).",
+            try:
+                html_en = self.http.get_text(en_url, validator=_is_valid_sfda_list_html, referer=en_base)
+                soup_en = BeautifulSoup(html_en, "lxml")
+                max_page = max(max_page, self._discover_max_page(soup_en, page_num))
+                rows = _extract_raw_rows_from_soup(soup_en, page_num)
+                if rows:
+                    logger.info(
+                        "Recovered page %d of [%s] via /en/ fallback (+%d rows).",
+                        page_num + 1,
+                        target.slug,
+                        len(rows),
+                    )
+                    return rows, max_page
+            except Exception as exc:
+                logger.warning(
+                    "Fallback /en/ fetch failed for page %d of [%s] (%s).",
                     page_num + 1,
                     target.slug,
-                    len(rows),
+                    exc,
                 )
-                return rows, max_page
 
-        # 3) Progressive retries alternating /en/ and /ar/ if both had a transient glitch
+        # 3) Progressive retries alternating /en/ and /ar/ with fresh HTTPX pool
         total_retries = len(retry_delays)
         for attempt_idx, delay in enumerate(retry_delays, start=1):
             use_en = (attempt_idx % 2 == 1) and (en_url != ar_url)
@@ -268,21 +277,30 @@ class SfdaScraper:
             self._reset_http_connection()
             time.sleep(delay)
 
-            html_retry = self.http.get_text(try_url, validator=_is_valid_sfda_list_html, referer=try_ref)
-            soup_retry = BeautifulSoup(html_retry, "lxml")
-            max_page = max(max_page, self._discover_max_page(soup_retry, page_num))
-            rows = _extract_raw_rows_from_soup(soup_retry, page_num)
-
-            if rows:
-                logger.info(
-                    "Recovered page %d of [%s] on retry %d/%d (+%d rows).",
-                    page_num + 1,
-                    target.slug,
+            try:
+                html_retry = self.http.get_text(try_url, validator=_is_valid_sfda_list_html, referer=try_ref)
+                soup_retry = BeautifulSoup(html_retry, "lxml")
+                max_page = max(max_page, self._discover_max_page(soup_retry, page_num))
+                rows = _extract_raw_rows_from_soup(soup_retry, page_num)
+                if rows:
+                    logger.info(
+                        "Recovered page %d of [%s] on retry %d/%d (+%d rows).",
+                        page_num + 1,
+                        target.slug,
+                        attempt_idx,
+                        total_retries,
+                        len(rows),
+                    )
+                    return rows, max_page
+            except Exception as exc:
+                logger.warning(
+                    "Retry %d/%d error on page %d of [%s]: %s",
                     attempt_idx,
                     total_retries,
-                    len(rows),
+                    page_num + 1,
+                    target.slug,
+                    exc,
                 )
-                return rows, max_page
 
         logger.warning(
             "Page %d of [%s] still returned 0 rows after /en/ fallback and %d retries; deferring to rescue pass.",
@@ -468,15 +486,18 @@ class SfdaScraper:
         known_total_pages: int | None = None,
         used_source_keys: set[str],
         max_pages_limit: int | None = None,
+        prior_failed_pages: list[int] | None = None,
     ) -> Iterator[tuple[int, int, list[IngredientRecord]]]:
         """
         Yield `(page_num, total_pages_known, records)` sequentially from `start_page`
-        through the final page of the list, followed by an end-of-list rescue pass.
+        through the final page of the list, followed by up to two end-of-list rescue passes.
         """
+        self.unrecovered_empty_pages.pop(target.slug, None)
+
         page_num = max(0, start_page)
         last_page_idx = (known_total_pages - 1) if (known_total_pages and known_total_pages > 0) else 0
         pages_processed = 0
-        deferred_empty_pages: list[int] = []
+        deferred_empty_pages: list[int] = [p - 1 for p in (prior_failed_pages or []) if p >= 1]
 
         while True:
             records, discovered_max = self.scrape_page_records(target, page_num, used_source_keys)
@@ -484,7 +505,7 @@ class SfdaScraper:
                 last_page_idx = discovered_max
 
             total_pages = last_page_idx + 1
-            if not records:
+            if not records and page_num not in deferred_empty_pages:
                 deferred_empty_pages.append(page_num)
 
             yield page_num, total_pages, records
@@ -498,46 +519,61 @@ class SfdaScraper:
 
             page_num += 1
 
-        # End-of-list rescue pass for any pages that remained empty on both /ar/ and /en/
+        # Two end-of-list rescue passes for any pages that remained empty on both /ar/ and /en/
         if deferred_empty_pages and max_pages_limit is None:
-            logger.info(
-                "Starting rescue pass for %d empty page(s) in [%s]: %s",
-                len(deferred_empty_pages),
-                target.slug,
-                [p + 1 for p in deferred_empty_pages],
+            pending_pages = sorted(set(deferred_empty_pages))
+            rescue_passes = (
+                (1, 12.0, _RESCUE_PASS_1_DELAYS),
+                (2, 25.0, _RESCUE_PASS_2_DELAYS),
             )
-            self._reset_http_connection()
-            time.sleep(10.0)
 
-            still_empty: list[int] = []
-            total_pages = last_page_idx + 1
-
-            for retry_page in deferred_empty_pages:
-                rescued_records, discovered_max = self.scrape_page_records(
-                    target,
-                    retry_page,
-                    used_source_keys,
-                    retry_delays=_RESCUE_PASS_RETRY_DELAYS,
-                )
-                if discovered_max > last_page_idx:
-                    last_page_idx = discovered_max
-                    total_pages = last_page_idx + 1
-
-                if rescued_records:
-                    logger.info(
-                        "Rescue pass SUCCEEDED for page %d of [%s] (+%d rows).",
-                        retry_page + 1,
-                        target.slug,
-                        len(rescued_records),
-                    )
-                    yield retry_page, total_pages, rescued_records
-                else:
-                    still_empty.append(retry_page + 1)
-
-            if still_empty:
-                self.unrecovered_empty_pages[target.slug] = still_empty
-                logger.warning(
-                    "Unrecovered empty pages on SFDA source for [%s] after rescue pass: %s",
+            for pass_no, cooldown_sec, pass_delays in rescue_passes:
+                if not pending_pages:
+                    break
+                logger.info(
+                    "Starting rescue pass #%d for %d empty page(s) in [%s]: %s",
+                    pass_no,
+                    len(pending_pages),
                     target.slug,
-                    still_empty,
+                    [p + 1 for p in pending_pages],
+                )
+                self._reset_http_connection()
+                time.sleep(cooldown_sec)
+
+                next_pending: list[int] = []
+                total_pages = last_page_idx + 1
+
+                for retry_page in pending_pages:
+                    rescued_records, discovered_max = self.scrape_page_records(
+                        target,
+                        retry_page,
+                        used_source_keys,
+                        retry_delays=pass_delays,
+                    )
+                    if discovered_max > last_page_idx:
+                        last_page_idx = discovered_max
+                        total_pages = last_page_idx + 1
+
+                    if rescued_records:
+                        logger.info(
+                            "Rescue pass #%d SUCCEEDED for page %d of [%s] (+%d rows).",
+                            pass_no,
+                            retry_page + 1,
+                            target.slug,
+                            len(rescued_records),
+                        )
+                        yield retry_page, total_pages, rescued_records
+                    else:
+                        next_pending.append(retry_page)
+
+                pending_pages = next_pending
+
+            if pending_pages:
+                failed_one_based = [p + 1 for p in pending_pages]
+                self.unrecovered_empty_pages[target.slug] = failed_one_based
+                logger.error(
+                    "INCOMPLETE LIST [%s]: %d page(s) still unrecovered after 2 rescue passes: %s",
+                    target.slug,
+                    len(failed_one_based),
+                    failed_one_based,
                 )
