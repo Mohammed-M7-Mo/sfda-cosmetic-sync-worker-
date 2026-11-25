@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 Entrypoint for the Resilient SFDA Cosmetic Mirror Sync Worker.
-Orchestrates checkpoint loading, polite paginated scraping, strict page-completeness
-verification, batch staging, emergency JSON export generation, and atomic WordPress commit.
+Orchestrates checkpoint loading, polite paginated scraping, two-tier completeness
+verification (hard outage block + additive-safe commit with WP Deletion Circuit Breaker),
+batch staging, emergency JSON export generation, and atomic WordPress commit.
 """
 
 from __future__ import annotations
@@ -80,13 +81,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _max_safe_drop(live_count: int) -> int:
-    """Mirror PHP Diff_Engine::calculate_max_safe_removals() (< 1 SFDA page of 10 rows)."""
-    if live_count <= 0:
-        return 0
-    return max(3, min(9, int(live_count * 0.02)))
-
-
 def flush_batch(
     uploader: WordPressUploader | None,
     session_uuid: str,
@@ -154,6 +148,7 @@ def run_sync(args: argparse.Namespace) -> int:
         "status": "running",
         "lists": {},
         "incomplete_lists": {},
+        "additive_safe_lists": {},
     }
 
     live_counts_by_slug: dict[str, int] = {}
@@ -279,9 +274,13 @@ def run_sync(args: argparse.Namespace) -> int:
         export_file = cp_mgr.build_emergency_export(state)
         log.info("Emergency JSON backup written to: %s", export_file)
 
-        # Strict Page-Completeness & Anti-Drop Gate per list before WordPress commit.
+        # Two-Tier Completeness Gate:
+        # Tier 1: Hard block if >12% of pages failed or scraped count dropped below 85% of live count.
+        # Tier 2: Additive-safe commit if a few transient pages failed (<=12% of pages); WP Deletion
+        #         Circuit Breaker automatically blocks all deletions while restoring/updating rows!
         eligible_commit_lists: list[str] = []
         incomplete_lists: dict[str, dict[str, Any]] = {}
+        additive_safe_lists: dict[str, list[int]] = {}
 
         for slug in config.lists_scope:
             prog = state.lists[slug]
@@ -290,46 +289,54 @@ def run_sync(args: argparse.Namespace) -> int:
                 continue
 
             live_cnt = live_counts_by_slug.get(slug, 0)
-            drop_delta = live_cnt - prog.items_scraped
-            max_drop = _max_safe_drop(live_cnt)
+            total_pgs = max(1, int(prog.total_pages or 1))
+            max_tolerable_empty_pages = max(12, int(total_pgs * 0.12))
 
-            if prog.failed_pages and not config.force_commit:
+            if len(prog.failed_pages) > max_tolerable_empty_pages and not config.force_commit:
                 incomplete_lists[slug] = {
-                    "reason": "unrecovered_empty_pages",
+                    "reason": "excessive_unrecovered_empty_pages",
                     "failed_pages": prog.failed_pages,
+                    "max_tolerable": max_tolerable_empty_pages,
                     "items_scraped": prog.items_scraped,
                     "live_count": live_cnt,
                 }
                 log.error(
-                    "BLOCKING COMMIT for [%s]: %d unrecovered empty page(s) %s. Live WordPress data kept intact.",
+                    "BLOCKING COMMIT for [%s]: %d unrecovered empty page(s) exceeds limit (%d). Live WordPress data kept intact.",
+                    slug,
+                    len(prog.failed_pages),
+                    max_tolerable_empty_pages,
+                )
+                continue
+
+            if live_cnt >= 20 and prog.items_scraped < int(live_cnt * 0.85) and not config.force_commit:
+                incomplete_lists[slug] = {
+                    "reason": "severe_count_drop",
+                    "items_scraped": prog.items_scraped,
+                    "live_count": live_cnt,
+                    "min_required": int(live_cnt * 0.85),
+                }
+                log.error(
+                    "BLOCKING COMMIT for [%s]: scraped %d vs live %d (<85%% threshold). Live WordPress data kept intact.",
+                    slug,
+                    prog.items_scraped,
+                    live_cnt,
+                )
+                continue
+
+            if prog.failed_pages:
+                additive_safe_lists[slug] = prog.failed_pages
+                log.warning(
+                    "ADDITIVE-SAFE COMMIT enabled for [%s]: %d transient empty page(s) %s — "
+                    "WordPress Deletion Circuit Breaker will block all deletions while restoring/updating scraped items.",
                     slug,
                     len(prog.failed_pages),
                     prog.failed_pages,
                 )
-                continue
-
-            if live_cnt > 0 and drop_delta > max_drop and not config.force_commit:
-                incomplete_lists[slug] = {
-                    "reason": "anomalous_count_drop",
-                    "items_scraped": prog.items_scraped,
-                    "live_count": live_cnt,
-                    "drop_delta": drop_delta,
-                    "max_safe_drop": max_drop,
-                }
-                log.error(
-                    "BLOCKING COMMIT for [%s]: scraped %d vs live %d (drop of %d exceeds safe threshold %d). "
-                    "Likely truncated SFDA pagination — live WordPress data kept intact.",
-                    slug,
-                    prog.items_scraped,
-                    live_cnt,
-                    drop_delta,
-                    max_drop,
-                )
-                continue
 
             eligible_commit_lists.append(slug)
 
         summary["incomplete_lists"] = incomplete_lists
+        summary["additive_safe_lists"] = additive_safe_lists
 
         exit_code = 0
         if not config.dry_run and uploader is not None:
@@ -364,12 +371,12 @@ def run_sync(args: argparse.Namespace) -> int:
                 if incomplete_lists:
                     summary["status"] = "partial_committed_incomplete_lists_skipped"
                     log.error(
-                        "Skipped committing incomplete list(s): %s. Re-run for those list(s) to sync them safely.",
+                        "Skipped committing severely incomplete list(s): %s.",
                         list(incomplete_lists.keys()),
                     )
                     exit_code = 1
                 else:
-                    summary["status"] = "committed"
+                    summary["status"] = "committed_additive_safe" if additive_safe_lists else "committed"
             else:
                 reason = f"Strict completeness gate blocked all lists: {list(incomplete_lists.keys())}"
                 log.error("%s — aborting WP staging so live database remains 100%% untouched.", reason)
