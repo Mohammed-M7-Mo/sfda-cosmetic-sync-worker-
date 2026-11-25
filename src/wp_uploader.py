@@ -1,6 +1,6 @@
 """
 HMAC-SHA256 signed client for the WordPress SFDA Mirror Sync REST API.
-Matches `Hmac_Authenticator` and `Sync_Rest_Controller` from Stage 3.
+Matches `Hmac_Authenticator` and `Sync_Rest_Controller` (including Deletion Circuit Breaker).
 """
 
 from __future__ import annotations
@@ -73,7 +73,7 @@ class WordPressUploader:
                 "X-SFDA-Signature": signature,
                 "Content-Type": "application/json; charset=utf-8",
                 "Accept": "application/json",
-                "User-Agent": "SFDA-Sync-Worker/1.0",
+                "User-Agent": "SFDA-Sync-Worker/1.1",
             }
 
             try:
@@ -147,7 +147,9 @@ class WordPressUploader:
         completed_lists: list[str],
         expected_counts: dict[str, int],
         *,
+        failed_pages: dict[str, int] | None = None,
         force_commit: bool = False,
+        allow_mass_delete: bool = False,
     ) -> dict[str, Any]:
         return self._request(
             "POST",
@@ -156,7 +158,9 @@ class WordPressUploader:
                 "session_uuid": session_uuid,
                 "completed_lists": completed_lists,
                 "expected_counts": expected_counts,
+                "failed_pages": failed_pages or {},
                 "force_commit": force_commit,
+                "allow_mass_delete": allow_mass_delete,
             },
         )
 
