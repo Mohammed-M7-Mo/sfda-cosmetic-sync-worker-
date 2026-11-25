@@ -3,7 +3,7 @@ SFDA Cosmetic Lists HTML Scraper & Detail Extractor.
 Built directly against the verified Drupal HTML & `/ar/details_data` structure.
 Automatically switches to the `/en/` mirror URL whenever SFDA's `/ar/` cache returns
 an empty 200 OK ("لا توجد نتائج") page, and runs two rescue passes with clean HTTP
-session resets to recover 100% of pages before reporting any unrecovered page.
+session resets and CDN cache-busting parameters to recover empty pages.
 """
 
 from __future__ import annotations
@@ -204,8 +204,8 @@ class SfdaScraper:
         """
         Fetch a single paginated list page (`?page=N`) and return:
         `(rows_on_page, discovered_max_page_index)`.
-        If `/ar/` returns 0 rows ("لا توجد نتائج") or fails transiently, immediately falls back
-        to `/en/` and resets the HTTP session on progressive retries.
+        If `/ar/` returns 0 rows or fails transiently, falls back to `/en/`
+        and uses cache-busting query parameters on progressive retries.
         """
         ar_url = f"{target.url}?page={page_num}" if page_num > 0 else target.url
         en_base = _to_english_sfda_url(target.url)
@@ -258,11 +258,13 @@ class SfdaScraper:
                     exc,
                 )
 
-        # 3) Progressive retries alternating /en/ and /ar/ with fresh HTTPX pool
+        # 3) Progressive retries alternating /en/ and /ar/ with fresh HTTPX pool & CDN cache-buster
         total_retries = len(retry_delays)
         for attempt_idx, delay in enumerate(retry_delays, start=1):
             use_en = (attempt_idx % 2 == 1) and (en_url != ar_url)
-            try_url = en_url if use_en else ar_url
+            base_try_url = en_url if use_en else ar_url
+            sep = "&" if "?" in base_try_url else "?"
+            try_url = f"{base_try_url}{sep}_cb={int(time.time())}_{attempt_idx}"
             try_ref = en_base if use_en else target.url
 
             logger.warning(
@@ -571,8 +573,8 @@ class SfdaScraper:
             if pending_pages:
                 failed_one_based = [p + 1 for p in pending_pages]
                 self.unrecovered_empty_pages[target.slug] = failed_one_based
-                logger.error(
-                    "INCOMPLETE LIST [%s]: %d page(s) still unrecovered after 2 rescue passes: %s",
+                logger.warning(
+                    "PARTIAL EMPTY PAGES [%s]: %d page(s) still empty on SFDA after 2 rescue passes: %s",
                     target.slug,
                     len(failed_one_based),
                     failed_one_based,
