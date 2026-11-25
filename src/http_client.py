@@ -1,6 +1,6 @@
 """
-Fault-tolerant HTTPX client with thread-safe rate limiting, randomized jitter,
-exponential backoff, and soft-block validation.
+Fault-tolerant HTTPX client with thread-safe rate limiting, session reset,
+randomized jitter, exponential backoff, and soft-block validation.
 """
 
 from __future__ import annotations
@@ -36,23 +36,44 @@ class ResilientHttpClient:
         self.timeout_sec = timeout_sec
         self.max_retries = max_retries
         self.min_delay_sec = min_delay_sec
+        self.max_connections = max_connections
         self._rate_lock = threading.Lock()
+        self._client_lock = threading.Lock()
         self._last_request_monotonic = 0.0
+        self._client = self._build_client()
 
-        self._client = httpx.Client(
+    def _build_client(self) -> httpx.Client:
+        return httpx.Client(
             headers={
                 "User-Agent": BROWSER_USER_AGENT,
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
                 "Connection": "keep-alive",
             },
-            timeout=httpx.Timeout(timeout_sec, connect=20.0),
-            limits=httpx.Limits(max_connections=max_connections, max_keepalive_connections=max_connections),
+            timeout=httpx.Timeout(self.timeout_sec, connect=20.0),
+            limits=httpx.Limits(
+                max_connections=self.max_connections,
+                max_keepalive_connections=self.max_connections,
+            ),
             follow_redirects=True,
         )
 
+    def reset_session(self) -> None:
+        """Close the current HTTPX connection pool/cookies and open a clean client."""
+        with self._client_lock:
+            old_client = self._client
+            self._client = self._build_client()
+        try:
+            old_client.close()
+        except Exception:
+            pass
+        logger.debug("HTTPX session & connection pool reset cleanly.")
+
     def close(self) -> None:
-        self._client.close()
+        with self._client_lock:
+            self._client.close()
 
     def __enter__(self) -> ResilientHttpClient:
         return self
@@ -87,7 +108,9 @@ class ResilientHttpClient:
         for attempt in range(1, self.max_retries + 1):
             self._wait_rate_limit()
             try:
-                resp = self._client.get(url, headers=extra_headers)
+                with self._client_lock:
+                    client = self._client
+                resp = client.get(url, headers=extra_headers)
                 if resp.status_code in RETRYABLE_STATUS_CODES:
                     raise httpx.HTTPStatusError(
                         f"Retryable HTTP status {resp.status_code}",
@@ -108,6 +131,8 @@ class ResilientHttpClient:
                     raise
                 if attempt >= self.max_retries:
                     break
+                if attempt >= 2:
+                    self.reset_session()
                 backoff = min(60.0, (2.0 ** attempt) + random.uniform(0.3, 1.8))
                 logger.warning(
                     "Attempt %d/%d failed for %s (%s). Backing off %.1fs...",
