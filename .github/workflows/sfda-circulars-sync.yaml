@@ -1,0 +1,96 @@
+name: SFDA Circulars & Decisions Sync (Food & Cosmetics)
+
+on:
+  # يمكن تفعيل التشغيل التلقائي لاحقاً بإزالة علامة # من السطرين التاليين (مرتين يومياً: 9 صباحاً و9 مساءً بتوقيت الرياض)
+  # schedule:
+  #   - cron: "0 6,18 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "وضع المزامنة (auto = سحب كامل أول مرة ثم سريع للمستجدات، full = كامل، incremental = المستجدات فقط)"
+        required: true
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - incremental
+          - full
+      sectors:
+        description: "القطاعات المطلوبة (food,cosmetics)"
+        required: true
+        default: "food,cosmetics"
+        type: string
+      dry_run:
+        description: "تشغيل تجريبي بدون إرسال لووردبريس (يولّد ملف JSON فقط)"
+        required: false
+        default: false
+        type: boolean
+      force_baseline:
+        description: "حفظ التعاميم الجديدة كأرشيف بدون إطلاق إشعارات أو إيميلات"
+        required: false
+        default: false
+        type: boolean
+      max_pages:
+        description: "حد أقصى للصفحات لكل قطاع للاختبار السريع (اتركه فارغاً للسحب الكامل)"
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: sfda-circulars-sync
+  cancel-in-progress: false
+
+jobs:
+  sync_circulars:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: "requirements.txt"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run SFDA Circulars & Decisions Sync Worker
+        env:
+          WP_SYNC_BASE_URL: ${{ secrets.WP_SYNC_BASE_URL }}
+          WP_SFDA_API_KEY: ${{ secrets.WP_SFDA_API_KEY }}
+          WP_SFDA_HMAC_SECRET: ${{ secrets.WP_SFDA_HMAC_SECRET }}
+          SFDA_REQUEST_DELAY_SEC: "0.45"
+          SFDA_DETAIL_CONCURRENCY: "2"
+          SFDA_HTTP_TIMEOUT_SEC: "45"
+          SFDA_MAX_RETRIES: "5"
+          SFDA_CIRCULARS_BATCH_SIZE: "50"
+        run: |
+          ARGS="--mode ${{ github.event.inputs.mode || 'auto' }} --sectors ${{ github.event.inputs.sectors || 'food,cosmetics' }}"
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          if [ "${{ github.event.inputs.force_baseline }}" = "true" ]; then
+            ARGS="$ARGS --force-baseline"
+          fi
+          if [ -n "${{ github.event.inputs.max_pages }}" ]; then
+            ARGS="$ARGS --max-pages ${{ github.event.inputs.max_pages }}"
+          fi
+          python -m src.circulars_main $ARGS
+
+      - name: Upload Circulars JSON Backup & Summary Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sfda-circulars-backup-${{ github.run_id }}
+          path: |
+            state/sfda_circulars_export.json
+            state/circulars_summary.json
+          retention-days: 14
+          if-no-files-found: ignore
