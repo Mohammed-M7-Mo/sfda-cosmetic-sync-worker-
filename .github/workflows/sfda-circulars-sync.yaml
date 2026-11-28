@@ -2,8 +2,8 @@ name: SFDA Circulars & Decisions Sync (Food & Cosmetics)
 
 on:
   # يمكن تفعيل التشغيل التلقائي لاحقاً بإزالة علامة # من السطرين التاليين (مرتين يومياً: 9 صباحاً و9 مساءً بتوقيت الرياض)
-  # schedule:
-  #   - cron: "0 6,18 * * *"
+   schedule:
+   - cron: "0 6,18 * * *"
   workflow_dispatch:
     inputs:
       mode:
